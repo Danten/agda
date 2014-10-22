@@ -15,6 +15,7 @@ import Control.Monad.Trans
 import Control.Monad.Reader
 
 import Data.Maybe
+import Data.Either (partitionEithers , lefts)
 import Data.List hiding (sort)
 import qualified Data.Map as Map
 import Data.Traversable (sequenceA)
@@ -31,7 +32,8 @@ import Agda.Syntax.Fixity
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Position
 import Agda.Syntax.Literal
-import Agda.Syntax.Scope.Base (emptyScopeInfo)
+import Agda.Syntax.Scope.Base (emptyScopeInfo, ThingsInScope)
+import Agda.Syntax.Scope.Monad (getNamedScope)
 import Agda.Syntax.Translation.InternalToAbstract (reify)
 
 import Agda.TypeChecking.Monad
@@ -364,15 +366,35 @@ checkExtendedLambda i di qname cs e t = do
 -- * Records
 ---------------------------------------------------------------------------
 
+expandModuleAssigns :: [Either A.Assign A.ModuleName] -> [C.Name] -> TCM A.Assigns
+expandModuleAssigns mfs exs = do
+  let (fs , ms) = partitionEithers mfs
+      exs' = exs \\ map fst fs
+  fs' <- forM exs' $ \ f -> do
+    pms <- forM ms $ \ m -> do
+       modScope <- getNamedScope m
+       let names :: ThingsInScope A.AbstractName
+           names = A.exportedNamesInScope modScope
+       case lookup names f of
+         Just [n] -> return (Just ())
+         _ -> return Nothing
+
+    case catMaybes pms of
+      [] -> return Nothing
+      [fa] -> return (Just fa)
+      _   -> typeError $ GenericError $ "Multiple modules have field " ++ show f
+  return (fs ++ catMaybes fs')
+
 -- | @checkRecordExpression fs e t@ checks record construction against type @t@.
 -- Precondition @e = Rec _ fs@.
-checkRecordExpression :: A.Assigns -> A.Expr -> Type -> TCM Term
-checkRecordExpression fs e t = do
+checkRecordExpression :: A.Assigns  -> A.Expr -> Type -> TCM Term
+checkRecordExpression fs' e t = do
   reportSDoc "tc.term.rec" 10 $ sep
     [ text "checking record expression"
     , prettyA e
     ]
   t <- reduce t
+  let mfs = map Left fs'
   case ignoreSharing $ unEl t of
     Def r es  -> do
       let ~(Just vs) = allApplyElims es
@@ -387,6 +409,7 @@ checkRecordExpression fs e t = do
 
       def <- getRecordDef r
       let axs  = recordFieldNames def
+          exs  = filter notHidden axs
           xs   = map unArg axs
           ftel = recTel def
           con  = killRange $ recConHead def
@@ -396,14 +419,15 @@ checkRecordExpression fs e t = do
         , text $ "  con = " ++ show con
         ]
       scope  <- getScope
+      fs <- expandModuleAssigns mfs (map unArg exs)
       let arg x e =
             case [ a | a <- axs, unArg a == x ] of
               [a] -> unnamed e <$ a
               _   -> defaultNamedArg e -- we only end up here if the field names are bad
       let meta x = A.Underscore $ A.MetaInfo (getRange e) scope Nothing (show x)
           missingExplicits = [ (unArg a, [unnamed . meta <$> a])
-                             | a <- axs, notHidden a
-                             , notElem (unArg a) (map fst fs) ]
+                             | a <- exs
+                             , unArg a `notElem` map fst fs ]
       -- In es omitted explicit fields are replaced by underscores
       -- (from missingExplicits). Omitted implicit or instance fields
       -- are still left out and inserted later by checkArguments_.
@@ -417,14 +441,14 @@ checkRecordExpression fs e t = do
       reportSDoc "tc.term.rec" 20 $ text $ "finished record expression"
       return $ Con con args
     MetaV _ _ -> do
-      let fields = map fst fs
+      let fields = map fst (lefts mfs)
       rs <- findPossibleRecords fields
       case rs of
           -- If there are no records with the right fields we might as well fail right away.
-        [] -> case fs of
-          []       -> typeError $ GenericError "There are no records in scope"
-          [(f, _)] -> typeError $ GenericError $ "There is no known record with the field " ++ show f
-          _        -> typeError $ GenericError $ "There is no known record with the fields " ++ unwords (map show fields)
+        [] -> case fields of
+          []  -> typeError $ GenericError "There are no records in scope"
+          [f] -> typeError $ GenericError $ "There is no known record with the field " ++ show f
+          _   -> typeError $ GenericError $ "There is no known record with the fields " ++ unwords (map show fields)
           -- If there's only one record with the appropriate fields, go with that.
         [r] -> do
           def <- getConstInfo r
